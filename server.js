@@ -1,259 +1,307 @@
+// Railway Server - Add this to your existing server code
 const express = require('express');
-const cors = require('cors');
-require('dotenv').config();
+const axios = require('axios');
+const cheerio = require('cheerio');
+const NodeCache = require('node-cache');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const cache = new NodeCache({ stdTTL: 300 }); // Cache for 5 minutes
 
-// Enhanced CORS configuration for Chrome extensions
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    
-    // Allow Chrome extension origins
-    if (origin.startsWith('chrome-extension://') || 
-        origin.startsWith('moz-extension://') ||
-        origin.includes('localhost') ||
-        origin.includes('127.0.0.1')) {
-      return callback(null, true);
-    }
-    
-    // Allow the specific domains
-    const allowedDomains = [
-      'https://filmfreeway.com',
-      'https://film-waiver-api-production.up.railway.app'
-    ];
-    
-    if (allowedDomains.some(domain => origin.startsWith(domain))) {
-      return callback(null, true);
-    }
-    
-    callback(null, true); // Allow all for now
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
-
-app.use(express.json());
-
-// Add request logging
+// Add CORS middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
 });
 
-// Sample waiver data (replace with your database later)
-const waivers = [
-  {
-    id: 1,
-    title: "Sundance Film Festival",
-    description: "Premier independent film festival showcasing innovative storytelling",
-    discount: "25% OFF",
-    code: "SUNDANCE25",
-    festival_url: "filmfreeway.com/sundance",
-    offer: "Get 25% off your submission fee",
-    festival_name: "Sundance Film Festival"
-  },
-  {
-    id: 2,
-    title: "Cannes Film Market",
-    description: "International film festival and market in the French Riviera",
-    discount: "15% OFF",
-    code: "CANNES15",
-    festival_url: "filmfreeway.com/cannes",
-    offer: "Save 15% on market submissions",
-    festival_name: "Cannes Film Market"
-  },
-  {
-    id: 3,
-    title: "SXSW Film Festival",
-    description: "South by Southwest - Film, interactive media and music festival",
-    discount: "30% OFF",
-    code: "SXSW30",
-    festival_url: "filmfreeway.com/sxsw",
-    offer: "Huge 30% discount on all submissions",
-    festival_name: "SXSW Film Festival"
-  },
-  {
-    id: 4,
-    title: "Toronto International Film Festival",
-    description: "One of the world's largest publicly attended film festivals",
-    discount: "20% OFF",
-    code: "TIFF20",
-    festival_url: "filmfreeway.com/tiff",
-    offer: "20% off TIFF submissions",
-    festival_name: "Toronto International Film Festival"
-  },
-  {
-    id: 5,
-    title: "Berlin International Film Festival",
-    description: "Berlinale - Major international film festival held annually",
-    discount: "18% OFF",
-    code: "BERLIN18",
-    festival_url: "filmfreeway.com/berlinale",
-    offer: "18% savings on Berlinale entries",
-    festival_name: "Berlin International Film Festival"
-  },
-  {
-    id: 6,
-    title: "Venice International Film Festival",
-    description: "World's oldest film festival held annually in Venice, Italy",
-    discount: "22% OFF",
-    code: "VENICE22",
-    festival_url: "filmfreeway.com/venice",
-    offer: "22% discount for Venice submissions",
-    festival_name: "Venice International Film Festival"
-  },
-  {
-    id: 7,
-    title: "Tribeca Film Festival",
-    description: "Celebrating storytellers and diverse voices in cinema",
-    discount: "12% OFF",
-    code: "TRIBECA12",
-    festival_url: "filmfreeway.com/tribeca",
-    offer: "12% off your Tribeca submission",
-    festival_name: "Tribeca Film Festival"
-  },
-  {
-    id: 8,
-    title: "Austin Film Festival",
-    description: "Writers' festival focusing on screenwriters and filmmakers",
-    discount: "25% OFF",
-    code: "AUSTIN25",
-    festival_url: "filmfreeway.com/austin",
-    offer: "25% discount on script submissions",
-    festival_name: "Austin Film Festival"
-  }
-];
-
-// Routes
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Film Waiver API is running!',
-    version: '1.0.0',
-    endpoints: ['/waivers', '/search', '/health'],
-    timestamp: new Date().toISOString()
-  });
+// Real-time discounts endpoint
+app.get('/api/discounts/realtime', async (req, res) => {
+    try {
+        console.log('Fetching real-time discounts from FilmFreeway...');
+        
+        // Check cache first
+        const cachedDiscounts = cache.get('realtime_discounts');
+        if (cachedDiscounts) {
+            console.log('Returning cached discounts:', cachedDiscounts.length);
+            return res.json({
+                success: true,
+                discounts: cachedDiscounts,
+                source: 'cache',
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        // Scrape fresh data
+        const discounts = await scrapeFilmFreewayDiscounts();
+        
+        // Cache the results
+        cache.set('realtime_discounts', discounts);
+        
+        console.log('Successfully scraped', discounts.length, 'discounts');
+        res.json({
+            success: true,
+            discounts: discounts,
+            source: 'live_scrape',
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('Error fetching real-time discounts:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            discounts: []
+        });
+    }
 });
 
-app.get('/waivers', (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 0;
-    const limit = 10;
-    const startIndex = page * limit;
-    const endIndex = startIndex + limit;
-    
-    const paginatedWaivers = waivers.slice(startIndex, endIndex);
-    
-    res.json(paginatedWaivers);
-  } catch (error) {
-    console.error('Error in /waivers:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+// Search real-time discounts
+app.get('/api/discounts/search', async (req, res) => {
+    try {
+        const query = req.query.q || '';
+        console.log('Searching real-time discounts for:', query);
+        
+        // Get all discounts (from cache or fresh scrape)
+        let allDiscounts = cache.get('realtime_discounts');
+        if (!allDiscounts) {
+            allDiscounts = await scrapeFilmFreewayDiscounts();
+            cache.set('realtime_discounts', allDiscounts);
+        }
+        
+        // Filter by search query
+        const filteredDiscounts = allDiscounts.filter(discount => {
+            const searchText = `${discount.festival_name} ${discount.offer} ${discount.code}`.toLowerCase();
+            return searchText.includes(query.toLowerCase());
+        });
+        
+        res.json({
+            success: true,
+            discounts: filteredDiscounts,
+            query: query,
+            total_available: allDiscounts.length
+        });
+        
+    } catch (error) {
+        console.error('Error searching discounts:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            discounts: []
+        });
+    }
 });
 
-app.get('/search', (req, res) => {
-  try {
-    const query = req.query.q;
-    const page = parseInt(req.query.page) || 0;
-    const limit = 10;
+// Main scraping function
+async function scrapeFilmFreewayDiscounts() {
+    const discounts = [];
     
-    if (!query) {
-      return res.json([]);
+    try {
+        // Request the discounts page with proper headers
+        const response = await axios.get('https://filmfreeway.com/festivals/discounts', {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Upgrade-Insecure-Requests': '1'
+            },
+            timeout: 15000
+        });
+        
+        const $ = cheerio.load(response.data);
+        console.log('Successfully loaded FilmFreeway discounts page');
+        
+        // Try multiple selectors to find discount items
+        const possibleSelectors = [
+            '.festival-card',
+            '.discount-card', 
+            '.card',
+            '.festival-item',
+            '.discount-item',
+            '[data-festival-id]',
+            '.list-group-item',
+            '.row .col-md-4',
+            '.row .col-lg-4',
+            '.row .col-sm-6',
+            '.grid-item'
+        ];
+        
+        let $discountElements = $();
+        
+        // Find the best selector
+        for (const selector of possibleSelectors) {
+            const elements = $(selector);
+            if (elements.length > 0) {
+                $discountElements = elements;
+                console.log(`Found ${elements.length} elements with selector: ${selector}`);
+                break;
+            }
+        }
+        
+        // Fallback: look for elements containing discount code patterns
+        if ($discountElements.length === 0) {
+            console.log('No specific selectors worked, trying pattern matching...');
+            $('div, section, article, li').each((i, element) => {
+                const text = $(element).text();
+                if (text && /\b[A-Z0-9]{4,12}\b/.test(text) && text.length < 1000) {
+                    $discountElements = $discountElements.add(element);
+                }
+            });
+        }
+        
+        console.log(`Processing ${$discountElements.length} potential discount elements`);
+        
+        // Extract data from each element
+        $discountElements.each((index, element) => {
+            try {
+                const discount = extractDiscountData($, $(element));
+                if (discount) {
+                    discounts.push(discount);
+                }
+            } catch (e) {
+                console.error(`Error processing element ${index}:`, e.message);
+            }
+        });
+        
+        // Remove duplicates based on code
+        const uniqueDiscounts = discounts.filter((discount, index, self) => 
+            index === self.findIndex(d => d.code === discount.code)
+        );
+        
+        console.log(`Extracted ${uniqueDiscounts.length} unique discounts`);
+        return uniqueDiscounts;
+        
+    } catch (error) {
+        console.error('Error scraping FilmFreeway:', error.message);
+        throw error;
+    }
+}
+
+// Extract discount data from a single element
+function extractDiscountData($, $element) {
+    // Extract festival name
+    let festivalName = '';
+    const nameSelectors = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '.title', '.name', '.festival-name', '.festival-title'];
+    
+    for (const selector of nameSelectors) {
+        const $nameEl = $element.find(selector).first();
+        if ($nameEl.length && $nameEl.text().trim()) {
+            festivalName = $nameEl.text().trim();
+            // Clean up
+            festivalName = festivalName.replace(/\s*-\s*FilmFreeway.*$/i, '');
+            festivalName = festivalName.replace(/\s*\|\s*FilmFreeway.*$/i, '');
+            break;
+        }
     }
     
-    const filtered = waivers.filter(waiver => 
-      waiver.title.toLowerCase().includes(query.toLowerCase()) ||
-      waiver.description.toLowerCase().includes(query.toLowerCase()) ||
-      waiver.code.toLowerCase().includes(query.toLowerCase())
-    );
-    
-    const startIndex = page * limit;
-    const endIndex = startIndex + limit;
-    const paginatedResults = filtered.slice(startIndex, endIndex);
-    
-    res.json(paginatedResults);
-  } catch (error) {
-    console.error('Error in /search:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Legacy API endpoints for backwards compatibility
-app.post('/api/v1/lookup', (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 0;
-    const limit = 10;
-    const startIndex = page * limit;
-    const endIndex = startIndex + limit;
-    
-    const paginatedWaivers = waivers.slice(startIndex, endIndex);
-    res.json(paginatedWaivers);
-  } catch (error) {
-    console.error('Error in /api/v1/lookup:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/v1/search', (req, res) => {
-  try {
-    const query = req.query.q;
-    const page = parseInt(req.query.page) || 0;
-    const limit = 10;
-    
-    if (!query) {
-      return res.json([]);
+    // Fallback: look for festival-like text
+    if (!festivalName) {
+        const text = $element.text();
+        const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 5);
+        for (const line of lines) {
+            if (/festival|film|cinema|movie|competition/i.test(line) && line.length < 150 && line.length > 10) {
+                festivalName = line;
+                break;
+            }
+        }
     }
     
-    const filtered = waivers.filter(waiver => 
-      waiver.title.toLowerCase().includes(query.toLowerCase()) ||
-      waiver.description.toLowerCase().includes(query.toLowerCase()) ||
-      waiver.code.toLowerCase().includes(query.toLowerCase())
-    );
+    // Extract discount code
+    let discountCode = '';
+    const codeSelectors = ['.code', '.discount-code', '.coupon-code', '.promo-code', '.badge', '.tag'];
     
-    const startIndex = page * limit;
-    const endIndex = startIndex + limit;
-    const paginatedResults = filtered.slice(startIndex, endIndex);
+    for (const selector of codeSelectors) {
+        const $codeEl = $element.find(selector).first();
+        if ($codeEl.length && $codeEl.text().trim()) {
+            discountCode = $codeEl.text().trim();
+            break;
+        }
+    }
     
-    res.json(paginatedResults);
-  } catch (error) {
-    console.error('Error in /api/v1/search:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+    // Fallback: pattern matching for codes
+    if (!discountCode) {
+        const text = $element.text();
+        const codeMatches = text.match(/\b([A-Z0-9]{4,12})\b/g);
+        if (codeMatches) {
+            // Filter for reasonable looking codes
+            const goodCodes = codeMatches.filter(code => 
+                code.length >= 4 && code.length <= 12 &&
+                !/^\d+$/.test(code) && // Not just numbers
+                !/^[A-Z]+$/.test(code) && // Not just letters
+                !/^(THE|AND|FOR|WITH|FROM|FILM|FEST)$/.test(code) // Not common words
+            );
+            if (goodCodes.length > 0) {
+                discountCode = goodCodes[0];
+            }
+        }
+    }
+    
+    // Extract offer description
+    let offer = '';
+    const offerSelectors = ['.offer', '.discount', '.deal', '.description', '.savings', '.percent', 'p'];
+    
+    for (const selector of offerSelectors) {
+        const $offerEl = $element.find(selector).first();
+        if ($offerEl.length && $offerEl.text().trim() && 
+            $offerEl.text().trim() !== festivalName && 
+            $offerEl.text().trim() !== discountCode) {
+            offer = $offerEl.text().trim();
+            if (offer.length > 5) break;
+        }
+    }
+    
+    // Look for percentage/dollar offers in text
+    if (!offer) {
+        const text = $element.text();
+        const offerMatch = text.match(/(\d+%\s*off|\$\d+\s*off|free\s*submission|waived\s*fees?|no\s*fee)/i);
+        if (offerMatch) {
+            offer = offerMatch[0];
+        }
+    }
+    
+    // Extract URL
+    let url = '';
+    const $linkEl = $element.find('a[href]').first();
+    if ($linkEl.length) {
+        url = $linkEl.attr('href');
+        if (url && url.startsWith('/')) {
+            url = 'https://filmfreeway.com' + url;
+        }
+    }
+    
+    // Only return if we have essential data
+    if (festivalName && discountCode && 
+        festivalName.length > 2 && discountCode.length >= 3) {
+        return {
+            festival_name: festivalName,
+            code: discountCode,
+            offer: offer || 'Discount available',
+            url: url || '',
+            scraped_at: new Date().toISOString(),
+            source: 'filmfreeway_realtime'
+        };
+    }
+    
+    return null;
+}
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        cache_size: cache.keys().length
+    });
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    waivers_count: waivers.length
-  });
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: error.message 
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Not found',
-    message: `Route ${req.method} ${req.path} not found`,
-    available_endpoints: ['/waivers', '/search', '/health']
-  });
-});
-
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Film Waiver API running on port ${PORT}`);
-  console.log(`Available at: http://localhost:${PORT}`);
-  console.log(`Waivers loaded: ${waivers.length}`);
+    console.log(`Film Waiver API server running on port ${PORT}`);
 });
+
+module.exports = app;
